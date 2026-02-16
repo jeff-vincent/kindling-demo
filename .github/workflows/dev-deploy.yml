@@ -5,7 +5,7 @@
 # Uses reusable kindling actions to eliminate boilerplate:
 #   - kindling-detect-changes: skip unchanged services
 #   - kindling-build:          Kaniko image build via sidecar
-#   - kindling-deploy:         DSE apply + rollout wait via sidecar
+#   - kindling-deploy:         DSE apply + rollout wait via sidecar 
 # ─────────────────────────────────────────────────────────────────
 name: Dev Deploy
 
