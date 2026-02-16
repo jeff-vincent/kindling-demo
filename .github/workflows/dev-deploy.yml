@@ -2,338 +2,105 @@
 # dev-deploy.yml — Build platform-api + dashboard UI and deploy
 # both to your local Kind cluster via kindling.
 #
-# This workflow runs on your SELF-HOSTED runner (created by the
-# GithubActionRunnerPool CR). It uses Kaniko to build container
-# images and pushes them to the in-cluster registry at registry:5000.
-# It then applies two DevStagingEnvironment CRs:
-#   1. platform-api  — Go API with 5 backing services
-#   2. platform-ui   — React dashboard served by nginx
-#
-# No Docker daemon required — Kaniko builds in userspace pods.
+# Uses reusable kindling actions to eliminate boilerplate:
+#   - kindling-detect-changes: skip unchanged services
+#   - kindling-build:          Kaniko image build via sidecar
+#   - kindling-deploy:         DSE apply + rollout wait via sidecar
 # ─────────────────────────────────────────────────────────────────
 name: Dev Deploy
 
 on:
   push:
     branches: [main]
-    paths:
-      - "**"
-      - ".github/workflows/dev-deploy.yml"
-  workflow_dispatch: # allow manual triggers for testing
+  workflow_dispatch:
+
+env:
+  REGISTRY: "registry:5000"
+  TAG: "${{ github.actor }}-${{ github.sha }}"
 
 jobs:
   build-and-deploy:
     runs-on: [self-hosted, "${{ github.actor }}"]
 
-    env:
-      APP_NAME: platform-api
-      UI_NAME: platform-api-ui
-      TAG: "${{ github.actor }}-${{ github.sha }}"
-      REGISTRY: "registry:5000"
-
     steps:
-      # ── 0. Clean shared /builds dir from any previous run ────────
-      - name: Clean builds directory
-        run: |
-          echo "🧹 Cleaning stale signal files from /builds..."
-          rm -f /builds/*.done /builds/*.request /builds/*.processing \
-                /builds/*.apply /builds/*.apply-done /builds/*.apply-log \
-                /builds/*.apply-exitcode /builds/*.kubectl \
-                /builds/*.kubectl-done /builds/*.kubectl-log \
-                /builds/*.kubectl-exitcode /builds/*.exitcode \
-                /builds/*.log /builds/*.dest /builds/*.tar.gz \
-                /builds/*.yaml /builds/*.sh /builds/portfwd-ready \
-                /builds/portfwd-stop
-          echo "✅ /builds is clean"
-
-      # ── 1. Checkout ──────────────────────────────────────────────
+      # ── 0. Checkout ──────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need previous commit for change detection
 
-      # ── 2a. Build API image via the build-agent sidecar ──────────
-      - name: Build & push API image via Kaniko
+      # ── 1. Detect changes ────────────────────────────────────────
+      - name: Detect changes
+        id: changes
+        uses: jeff-vincent/kindling/.github/actions/kindling-detect-changes@main
+        with:
+          services: '[{"name":"platform-api","path":"./"},{"name":"platform-api-ui","path":"./ui"}]'
+          actor: ${{ github.actor }}
+
+      # ── 2. Build API (if changed) ───────────────────────────────
+      - name: Build API image
+        if: fromJSON(steps.changes.outputs.changes).platform-api
+        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+        with:
+          name: platform-api
+          context: ${{ github.workspace }}
+          image: "${{ env.REGISTRY }}/platform-api:${{ env.TAG }}"
+          exclude: "./ui"
+
+      # ── 3. Build UI (if changed) ────────────────────────────────
+      - name: Build UI image
+        if: fromJSON(steps.changes.outputs.changes).platform-api-ui
+        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+        with:
+          name: platform-api-ui
+          context: "${{ github.workspace }}/ui"
+          image: "${{ env.REGISTRY }}/platform-api-ui:${{ env.TAG }}"
+
+      # ── 4. Deploy API (if changed) ──────────────────────────────
+      - name: Deploy API
+        if: fromJSON(steps.changes.outputs.changes).platform-api
+        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+        with:
+          name: "${{ github.actor }}-platform-api"
+          image: "${{ env.REGISTRY }}/platform-api:${{ env.TAG }}"
+          port: "8080"
+          labels: |
+            app.kubernetes.io/part-of: platform-api
+            app.kubernetes.io/component: api
+            apps.example.com/github-username: ${{ github.actor }}
+          ingress-host: "${{ github.actor }}-platform-api.localhost"
+          dependencies: |
+            - type: postgres
+              version: "16"
+            - type: redis
+            - type: elasticsearch
+            - type: kafka
+            - type: vault
+
+      # ── 5. Deploy UI (if changed) ───────────────────────────────
+      - name: Deploy UI
+        if: fromJSON(steps.changes.outputs.changes).platform-api-ui
+        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+        with:
+          name: "${{ github.actor }}-platform-api-ui"
+          image: "${{ env.REGISTRY }}/platform-api-ui:${{ env.TAG }}"
+          port: "80"
+          health-check-path: "/"
+          labels: |
+            app.kubernetes.io/part-of: platform-api
+            app.kubernetes.io/component: ui
+            apps.example.com/github-username: ${{ github.actor }}
+          env: |
+            - name: API_URL
+              value: "http://${{ github.actor }}-platform-api:8080"
+          ingress-host: "${{ github.actor }}-platform-ui.localhost"
+
+      # ── 6. Summary ──────────────────────────────────────────────
+      - name: Deploy summary
         run: |
-          tar -czf /builds/$APP_NAME.tar.gz -C ${{ github.workspace }} \
-            --exclude=./ui .
-          echo "$REGISTRY/$APP_NAME:$TAG" > /builds/$APP_NAME.dest
-          touch /builds/$APP_NAME.request
-          echo "⏳ Waiting for API Kaniko build..."
-          while [ ! -f /builds/$APP_NAME.done ]; do sleep 2; done
-          EXIT_CODE=$(cat /builds/$APP_NAME.exitcode)
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ API build failed:"; cat /builds/$APP_NAME.log; exit 1
-          fi
-          echo "✅ Built & pushed $APP_NAME:$TAG"
-
-      # ── 2b. Build UI image via the build-agent sidecar ──────────
-      - name: Build & push UI image via Kaniko
-        run: |
-          tar -czf /builds/$UI_NAME.tar.gz -C ${{ github.workspace }}/ui .
-          echo "$REGISTRY/$UI_NAME:$TAG" > /builds/$UI_NAME.dest
-          touch /builds/$UI_NAME.request
-          echo "⏳ Waiting for UI Kaniko build..."
-          while [ ! -f /builds/$UI_NAME.done ]; do sleep 2; done
-          EXIT_CODE=$(cat /builds/$UI_NAME.exitcode)
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ UI build failed:"; cat /builds/$UI_NAME.log; exit 1
-          fi
-          echo "✅ Built & pushed $UI_NAME:$TAG"
-
-      # ── 3a. Deploy API DevStagingEnvironment CR ──────────────────
-      - name: Deploy API to local Kind cluster
-        run: |
-          ACTOR="${{ github.actor }}"
-          cat > /builds/$APP_NAME-dse.yaml <<EOF
-          apiVersion: apps.example.com/v1alpha1
-          kind: DevStagingEnvironment
-          metadata:
-            name: ${ACTOR}-$APP_NAME
-            labels:
-              app.kubernetes.io/part-of: $APP_NAME
-              app.kubernetes.io/component: api
-              apps.example.com/github-username: ${ACTOR}
-          spec:
-            deployment:
-              image: $REGISTRY/$APP_NAME:$TAG
-              replicas: 1
-              port: 8080
-              healthCheck:
-                path: /healthz
-            service:
-              port: 8080
-              type: ClusterIP
-            ingress:
-              enabled: true
-              host: ${ACTOR}-$APP_NAME.localhost
-              ingressClassName: nginx
-            dependencies:
-              - type: postgres
-                version: "16"
-              - type: redis
-              - type: elasticsearch
-              - type: kafka
-              - type: vault
-          EOF
-          touch /builds/$APP_NAME-dse.apply
-          while [ ! -f /builds/$APP_NAME-dse.apply-done ]; do sleep 1; done
-          EXIT_CODE=$(cat /builds/$APP_NAME-dse.apply-exitcode)
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ API deploy failed:"; cat /builds/$APP_NAME-dse.apply-log; exit 1
-          fi
-          echo "✅ API DevStagingEnvironment applied"
-
-      # ── 3b. Deploy UI DevStagingEnvironment CR ───────────────────
-      - name: Deploy UI to local Kind cluster
-        run: |
-          ACTOR="${{ github.actor }}"
-          cat > /builds/$UI_NAME-dse.yaml <<EOF
-          apiVersion: apps.example.com/v1alpha1
-          kind: DevStagingEnvironment
-          metadata:
-            name: ${ACTOR}-$UI_NAME
-            labels:
-              app.kubernetes.io/part-of: $APP_NAME
-              app.kubernetes.io/component: ui
-              apps.example.com/github-username: ${ACTOR}
-          spec:
-            deployment:
-              image: $REGISTRY/$UI_NAME:$TAG
-              replicas: 1
-              port: 80
-              env:
-                - name: API_URL
-                  value: "http://${ACTOR}-$APP_NAME:8080"
-              healthCheck:
-                path: /
-            service:
-              port: 80
-              type: ClusterIP
-            ingress:
-              enabled: true
-              host: ${ACTOR}-platform-ui.localhost
-              ingressClassName: nginx
-          EOF
-          touch /builds/$UI_NAME-dse.apply
-          while [ ! -f /builds/$UI_NAME-dse.apply-done ]; do sleep 1; done
-          EXIT_CODE=$(cat /builds/$UI_NAME-dse.apply-exitcode)
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ UI deploy failed:"; cat /builds/$UI_NAME-dse.apply-log; exit 1
-          fi
-          echo "✅ UI DevStagingEnvironment applied"
-
-      # ── 4. Wait for rollout via sidecar ──────────────────────────
-      - name: Wait for deployment rollout
-        run: |
-          ACTOR="${{ github.actor }}"
-          cat > /builds/rollout-wait.sh <<SCRIPT
-          #!/bin/bash
-          set -e
-
-          # --- Wait for dependency deployments first ----------------
-          echo "⏳ Waiting for dependency deployments..."
-          for DEP in postgres redis elasticsearch kafka vault; do
-            DEP_DEPLOY="${ACTOR}-${APP_NAME}-\${DEP}"
-            echo "  Checking \${DEP_DEPLOY}..."
-            for i in \$(seq 1 30); do
-              if kubectl get deployment/\${DEP_DEPLOY} >/dev/null 2>&1; then
-                break
-              fi
-              sleep 2
-            done
-            kubectl rollout status deployment/\${DEP_DEPLOY} --timeout=120s
-            echo "  ✅ \${DEP_DEPLOY} ready"
-          done
-
-          # --- Wait for app deployments ----------------------------
-          echo ""
-          echo "⏳ Waiting for ${ACTOR}-$APP_NAME deployment..."
-          kubectl rollout status deployment/${ACTOR}-$APP_NAME \
-            --timeout=180s
-
-          echo ""
-          echo "⏳ Waiting for ${ACTOR}-$UI_NAME deployment..."
-          kubectl rollout status deployment/${ACTOR}-$UI_NAME \
-            --timeout=120s
-
-          # --- Wait for pods to be fully Ready (not just rollout) --
-          echo ""
-          echo "⏳ Waiting for app pods to be Ready..."
-          kubectl wait --for=condition=Ready \
-            pod -l app.kubernetes.io/name=${ACTOR}-$APP_NAME \
-            --timeout=60s 2>/dev/null || true
-          kubectl wait --for=condition=Ready \
-            pod -l app.kubernetes.io/name=${ACTOR}-$UI_NAME \
-            --timeout=60s 2>/dev/null || true
-
-          echo ""
-          echo "📦 Pods:"
-          kubectl get pods | grep -E "${ACTOR}-(${APP_NAME}|${UI_NAME})"
-
-          echo ""
-          echo "🌐 Services:"
-          kubectl get svc | grep -E "${ACTOR}-(${APP_NAME}|${UI_NAME}|.*postgres|.*redis|.*elasticsearch|.*kafka|.*vault)"
-
-          echo ""
-          echo "🎯 DevStagingEnvironments:"
-          kubectl get devstagingenvironments | grep -E "NAME|${ACTOR}"
-          SCRIPT
-          chmod +x /builds/rollout-wait.sh
-          touch /builds/rollout-wait.kubectl
-          while [ ! -f /builds/rollout-wait.kubectl-done ]; do sleep 2; done
-          cat /builds/rollout-wait.kubectl-log
-          EXIT_CODE=$(cat /builds/rollout-wait.kubectl-exitcode)
-          [ "$EXIT_CODE" = "0" ] || exit 1
-
-      # ── 5. Smoke test via sidecar ────────────────────────────────
-      - name: Smoke test
-        run: |
-          ACTOR="${{ github.actor }}"
-
-          # --- Start port-forward in the sidecar -------------------
-          cat > /builds/smoke-portfwd.sh <<SCRIPT
-          #!/bin/bash
-          # Wait for endpoints to exist before port-forwarding
-          for i in \$(seq 1 20); do
-            EP=\$(kubectl get endpoints ${ACTOR}-$APP_NAME -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
-            if [ -n "\$EP" ]; then break; fi
-            echo "  waiting for ${ACTOR}-$APP_NAME endpoints... (\$i/20)"
-            sleep 3
-          done
-          for i in \$(seq 1 20); do
-            EP=\$(kubectl get endpoints ${ACTOR}-$UI_NAME -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
-            if [ -n "\$EP" ]; then break; fi
-            echo "  waiting for ${ACTOR}-$UI_NAME endpoints... (\$i/20)"
-            sleep 3
-          done
-
-          kubectl port-forward svc/${ACTOR}-$APP_NAME 18080:8080 &
-          PF1=\$!
-          kubectl port-forward svc/${ACTOR}-$UI_NAME 18081:80 &
-          PF2=\$!
-          sleep 5
-          touch /builds/portfwd-ready
-          while [ ! -f /builds/portfwd-stop ]; do sleep 1; done
-          kill \$PF1 \$PF2 2>/dev/null || true
-          SCRIPT
-          chmod +x /builds/smoke-portfwd.sh
-          touch /builds/smoke-portfwd.kubectl
-
-          echo "⏳ Waiting for port-forward to establish..."
-          TIMEOUT=60
-          WAITED=0
-          while [ ! -f /builds/portfwd-ready ]; do
-            sleep 2
-            WAITED=$((WAITED+2))
-            if [ $WAITED -ge $TIMEOUT ]; then
-              echo "❌ Port-forward did not become ready in ${TIMEOUT}s"
-              cat /builds/smoke-portfwd.kubectl-log 2>/dev/null || true
-              exit 1
-            fi
-          done
-
-          # --- API Health check with retries -----------------------
-          echo "── API Health check ───────────────────"
-          API_OK=false
-          for i in $(seq 1 10); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://localhost:18080/healthz 2>/dev/null || echo "000")
-            if [ "$HTTP_CODE" = "200" ]; then
-              API_OK=true
-              echo "✅ API health check passed (attempt $i)"
-              break
-            fi
-            echo "  attempt $i/10 — HTTP $HTTP_CODE, retrying in 5s..."
-            sleep 5
-          done
-
-          if [ "$API_OK" != "true" ]; then
-            echo "❌ API health check failed after 10 attempts"
-            # Dump pod logs for debugging
-            cat > /builds/debug-pods.sh <<DBGSCRIPT
-            #!/bin/bash
-            echo "=== API pod logs ==="
-            kubectl logs -l app.kubernetes.io/name=${ACTOR}-$APP_NAME --tail=50 2>/dev/null || echo "(no logs)"
-            echo ""
-            echo "=== API pod describe ==="
-            kubectl describe pods -l app.kubernetes.io/name=${ACTOR}-$APP_NAME 2>/dev/null | tail -30
-            DBGSCRIPT
-            chmod +x /builds/debug-pods.sh
-            touch /builds/debug-pods.kubectl
-            while [ ! -f /builds/debug-pods.kubectl-done ]; do sleep 1; done
-            cat /builds/debug-pods.kubectl-log
-            touch /builds/portfwd-stop
-            while [ ! -f /builds/smoke-portfwd.kubectl-done ]; do sleep 1; done
-            exit 1
-          fi
-
-          echo ""
-          echo "── API Status (all dependencies) ──────"
-          curl -sf --connect-timeout 5 http://localhost:18080/status | jq . || echo "(not available yet — dependencies may still be initializing)"
-
-          # --- UI Health check with retries ------------------------
-          echo ""
-          echo "── UI Health check ────────────────────"
-          UI_OK=false
-          for i in $(seq 1 10); do
-            UI_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://localhost:18081/ 2>/dev/null || echo "000")
-            if [ "$UI_CODE" = "200" ]; then
-              UI_OK=true
-              echo "✅ UI health check passed (attempt $i)"
-              break
-            fi
-            echo "  attempt $i/10 — HTTP $UI_CODE, retrying in 5s..."
-            sleep 5
-          done
-
-          if [ "$UI_OK" != "true" ]; then
-            echo "⚠️  UI health check failed after 10 attempts (non-fatal)"
-          fi
-
-          # --- Cleanup ---------------------------------------------
-          touch /builds/portfwd-stop
-          while [ ! -f /builds/smoke-portfwd.kubectl-done ]; do sleep 1; done
-
           echo ""
           echo "🎉 Deploy complete!"
-          echo "🌐 Dashboard: http://${ACTOR}-platform-ui.localhost"
-          echo "🌐 API:       http://${ACTOR}-$APP_NAME.localhost"
-          echo "📡 Fallback:  kubectl port-forward svc/${ACTOR}-$UI_NAME 8080:80"
+          echo "${{ steps.changes.outputs.summary }}"
+          echo ""
+          echo "🌐 Dashboard: http://${{ github.actor }}-platform-ui.localhost"
+          echo "🌐 API:       http://${{ github.actor }}-platform-api.localhost"
