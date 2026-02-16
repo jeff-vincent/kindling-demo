@@ -9,7 +9,7 @@
 #   1. platform-api  — Go API with 5 backing services
 #   2. platform-ui   — React dashboard served by nginx
 #
-# No Docker daemon required — Kaniko builds in userspace pods.
+# No Docker daemon required — Kaniko builds in userspace pods. 
 # ─────────────────────────────────────────────────────────────────
 name: Dev Deploy
 
