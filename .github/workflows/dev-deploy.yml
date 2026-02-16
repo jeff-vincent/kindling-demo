@@ -1,12 +1,12 @@
 # ─────────────────────────────────────────────────────────────────
-# dev-deploy.yml — Build and deploy all microservices to your local
-# Kind cluster via kindling.
+# dev-deploy.yml — Build platform-api + dashboard UI and deploy
+# both to your local Kind cluster via kindling.
 #
-# Uses reusable kindling actions:
+# Uses reusable kindling actions to eliminate boilerplate:
 #   - kindling-build:  Kaniko image build via sidecar
 #   - kindling-deploy: DSE apply + rollout wait via sidecar
 # ─────────────────────────────────────────────────────────────────
-name: Microservices Deploy
+name: Dev Deploy
 
 on:
   push:
@@ -35,106 +35,65 @@ jobs:
                 /builds/*.log /builds/*.dest /builds/*.tar.gz \
                 /builds/*.yaml /builds/*.sh
 
-      # ── 1. Build images ─────────────────────────────────────────
-
-      - name: Build orders image
+      # ── 1. Build API ────────────────────────────────────────────
+      - name: Build API image
         uses: jeff-vincent/kindling/.github/actions/kindling-build@main
         with:
-          name: ms-orders
-          context: "${{ github.workspace }}/orders"
-          image: "${{ env.REGISTRY }}/ms-orders:${{ env.TAG }}"
+          name: platform-api
+          context: ${{ github.workspace }}
+          image: "${{ env.REGISTRY }}/platform-api:${{ env.TAG }}"
+          exclude: "./ui"
 
-      - name: Build inventory image
-        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
-        with:
-          name: ms-inventory
-          context: "${{ github.workspace }}/inventory"
-          image: "${{ env.REGISTRY }}/ms-inventory:${{ env.TAG }}"
-
-      - name: Build gateway image
-        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
-        with:
-          name: ms-gateway
-          context: "${{ github.workspace }}/gateway"
-          image: "${{ env.REGISTRY }}/ms-gateway:${{ env.TAG }}"
-
+      # ── 2. Build UI ─────────────────────────────────────────────
       - name: Build UI image
         uses: jeff-vincent/kindling/.github/actions/kindling-build@main
         with:
-          name: ms-ui
+          name: platform-api-ui
           context: "${{ github.workspace }}/ui"
-          image: "${{ env.REGISTRY }}/ms-ui:${{ env.TAG }}"
+          image: "${{ env.REGISTRY }}/platform-api-ui:${{ env.TAG }}"
 
-      # ── 2. Deploy services ──────────────────────────────────────
-
-      - name: Deploy orders
+      # ── 3. Deploy API ───────────────────────────────────────────
+      - name: Deploy API
         uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
         with:
-          name: "${{ github.actor }}-orders"
-          image: "${{ env.REGISTRY }}/ms-orders:${{ env.TAG }}"
-          port: "8081"
+          name: "${{ github.actor }}-platform-api"
+          image: "${{ env.REGISTRY }}/platform-api:${{ env.TAG }}"
+          port: "8080"
           labels: |
-            app.kubernetes.io/part-of: microservices-demo
-            app.kubernetes.io/component: orders
+            app.kubernetes.io/part-of: platform-api
+            app.kubernetes.io/component: api
             apps.example.com/github-username: ${{ github.actor }}
+          ingress-host: "${{ github.actor }}-platform-api.localhost"
           dependencies: |
             - type: postgres
               version: "16"
             - type: redis
+            - type: elasticsearch
+            - type: kafka
+            - type: vault
 
-      - name: Deploy inventory
+      # ── 4. Deploy UI ────────────────────────────────────────────
+      - name: Deploy UI
         uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
         with:
-          name: "${{ github.actor }}-inventory"
-          image: "${{ env.REGISTRY }}/ms-inventory:${{ env.TAG }}"
-          port: "8082"
-          labels: |
-            app.kubernetes.io/part-of: microservices-demo
-            app.kubernetes.io/component: inventory
-            apps.example.com/github-username: ${{ github.actor }}
-          env: |
-            - name: REDIS_URL
-              value: "redis://${{ github.actor }}-orders-redis:6379/0"
-          dependencies: |
-            - type: mongodb
-
-      - name: Deploy gateway
-        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
-        with:
-          name: "${{ github.actor }}-gateway"
-          image: "${{ env.REGISTRY }}/ms-gateway:${{ env.TAG }}"
-          port: "8080"
-          labels: |
-            app.kubernetes.io/part-of: microservices-demo
-            app.kubernetes.io/component: gateway
-            apps.example.com/github-username: ${{ github.actor }}
-          env: |
-            - name: ORDERS_SERVICE_URL
-              value: "http://${{ github.actor }}-orders:8081"
-            - name: INVENTORY_SERVICE_URL
-              value: "http://${{ github.actor }}-inventory:8082"
-
-      - name: Deploy UI dashboard
-        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
-        with:
-          name: "${{ github.actor }}-ui"
-          image: "${{ env.REGISTRY }}/ms-ui:${{ env.TAG }}"
+          name: "${{ github.actor }}-platform-api-ui"
+          image: "${{ env.REGISTRY }}/platform-api-ui:${{ env.TAG }}"
           port: "80"
           health-check-path: "/"
           labels: |
-            app.kubernetes.io/part-of: microservices-demo
+            app.kubernetes.io/part-of: platform-api
             app.kubernetes.io/component: ui
             apps.example.com/github-username: ${{ github.actor }}
           env: |
-            - name: GATEWAY_URL
-              value: "http://${{ github.actor }}-gateway:8080"
-          ingress-host: "${{ github.actor }}-ui.localhost"
+            - name: API_URL
+              value: "http://${{ github.actor }}-platform-api:8080"
+          ingress-host: "${{ github.actor }}-platform-ui.localhost"
 
-      # ── 3. Summary ──────────────────────────────────────────────
+      # ── 5. Summary ──────────────────────────────────────────────
       - name: Deploy summary
         run: |
           echo ""
           echo "🎉 Deploy complete!"
           echo ""
-          echo "🎨 UI dashboard: http://${{ github.actor }}-ui.localhost"
-          echo "📡 Fallback:     kubectl port-forward svc/${{ github.actor }}-gateway 8080:8080"
+          echo "🌐 Dashboard: http://${{ github.actor }}-platform-ui.localhost"
+          echo "🌐 API:       http://${{ github.actor }}-platform-api.localhost"
