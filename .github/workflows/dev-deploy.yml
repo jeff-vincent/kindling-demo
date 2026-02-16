@@ -9,7 +9,7 @@
 #   1. platform-api  — Go API with 5 backing services
 #   2. platform-ui   — React dashboard served by nginx
 #
-# No Docker daemon required — Kaniko builds in userspace pods. 
+# No Docker daemon required — Kaniko builds in userspace pods.
 # ─────────────────────────────────────────────────────────────────
 name: Dev Deploy
 
@@ -167,18 +167,47 @@ jobs:
           ACTOR="${{ github.actor }}"
           cat > /builds/rollout-wait.sh <<SCRIPT
           #!/bin/bash
+          set -e
+
+          # --- Wait for dependency deployments first ----------------
+          echo "⏳ Waiting for dependency deployments..."
+          for DEP in postgres redis elasticsearch kafka vault; do
+            DEP_DEPLOY="${ACTOR}-${APP_NAME}-\${DEP}"
+            echo "  Checking \${DEP_DEPLOY}..."
+            for i in \$(seq 1 30); do
+              if kubectl get deployment/\${DEP_DEPLOY} >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+            kubectl rollout status deployment/\${DEP_DEPLOY} --timeout=120s
+            echo "  ✅ \${DEP_DEPLOY} ready"
+          done
+
+          # --- Wait for app deployments ----------------------------
+          echo ""
           echo "⏳ Waiting for ${ACTOR}-$APP_NAME deployment..."
           kubectl rollout status deployment/${ACTOR}-$APP_NAME \
-            --timeout=180s || true
+            --timeout=180s
 
           echo ""
           echo "⏳ Waiting for ${ACTOR}-$UI_NAME deployment..."
           kubectl rollout status deployment/${ACTOR}-$UI_NAME \
-            --timeout=120s || true
+            --timeout=120s
+
+          # --- Wait for pods to be fully Ready (not just rollout) --
+          echo ""
+          echo "⏳ Waiting for app pods to be Ready..."
+          kubectl wait --for=condition=Ready \
+            pod -l app.kubernetes.io/name=${ACTOR}-$APP_NAME \
+            --timeout=60s 2>/dev/null || true
+          kubectl wait --for=condition=Ready \
+            pod -l app.kubernetes.io/name=${ACTOR}-$UI_NAME \
+            --timeout=60s 2>/dev/null || true
 
           echo ""
           echo "📦 Pods:"
-          kubectl get pods -l app.kubernetes.io/part-of=$APP_NAME
+          kubectl get pods | grep -E "${ACTOR}-(${APP_NAME}|${UI_NAME})"
 
           echo ""
           echo "🌐 Services:"
@@ -186,7 +215,7 @@ jobs:
 
           echo ""
           echo "🎯 DevStagingEnvironments:"
-          kubectl get devstagingenvironments -l app.kubernetes.io/part-of=$APP_NAME
+          kubectl get devstagingenvironments | grep -E "NAME|${ACTOR}"
           SCRIPT
           chmod +x /builds/rollout-wait.sh
           touch /builds/rollout-wait.kubectl
@@ -200,25 +229,77 @@ jobs:
         run: |
           ACTOR="${{ github.actor }}"
 
+          # --- Start port-forward in the sidecar -------------------
           cat > /builds/smoke-portfwd.sh <<SCRIPT
           #!/bin/bash
+          # Wait for endpoints to exist before port-forwarding
+          for i in \$(seq 1 20); do
+            EP=\$(kubectl get endpoints ${ACTOR}-$APP_NAME -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
+            if [ -n "\$EP" ]; then break; fi
+            echo "  waiting for ${ACTOR}-$APP_NAME endpoints... (\$i/20)"
+            sleep 3
+          done
+          for i in \$(seq 1 20); do
+            EP=\$(kubectl get endpoints ${ACTOR}-$UI_NAME -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
+            if [ -n "\$EP" ]; then break; fi
+            echo "  waiting for ${ACTOR}-$UI_NAME endpoints... (\$i/20)"
+            sleep 3
+          done
+
           kubectl port-forward svc/${ACTOR}-$APP_NAME 18080:8080 &
+          PF1=\$!
           kubectl port-forward svc/${ACTOR}-$UI_NAME 18081:80 &
-          sleep 3
+          PF2=\$!
+          sleep 5
           touch /builds/portfwd-ready
           while [ ! -f /builds/portfwd-stop ]; do sleep 1; done
-          kill %1 %2 2>/dev/null || true
+          kill \$PF1 \$PF2 2>/dev/null || true
           SCRIPT
           chmod +x /builds/smoke-portfwd.sh
           touch /builds/smoke-portfwd.kubectl
-          while [ ! -f /builds/portfwd-ready ]; do sleep 1; done
 
+          echo "⏳ Waiting for port-forward to establish..."
+          TIMEOUT=60
+          WAITED=0
+          while [ ! -f /builds/portfwd-ready ]; do
+            sleep 2
+            WAITED=$((WAITED+2))
+            if [ $WAITED -ge $TIMEOUT ]; then
+              echo "❌ Port-forward did not become ready in ${TIMEOUT}s"
+              cat /builds/smoke-portfwd.kubectl-log 2>/dev/null || true
+              exit 1
+            fi
+          done
+
+          # --- API Health check with retries -----------------------
           echo "── API Health check ───────────────────"
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18080/healthz)
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ API health check passed"
-          else
-            echo "❌ API health check failed (HTTP $HTTP_CODE)"
+          API_OK=false
+          for i in $(seq 1 10); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://localhost:18080/healthz 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              API_OK=true
+              echo "✅ API health check passed (attempt $i)"
+              break
+            fi
+            echo "  attempt $i/10 — HTTP $HTTP_CODE, retrying in 5s..."
+            sleep 5
+          done
+
+          if [ "$API_OK" != "true" ]; then
+            echo "❌ API health check failed after 10 attempts"
+            # Dump pod logs for debugging
+            cat > /builds/debug-pods.sh <<DBGSCRIPT
+            #!/bin/bash
+            echo "=== API pod logs ==="
+            kubectl logs -l app.kubernetes.io/name=${ACTOR}-$APP_NAME --tail=50 2>/dev/null || echo "(no logs)"
+            echo ""
+            echo "=== API pod describe ==="
+            kubectl describe pods -l app.kubernetes.io/name=${ACTOR}-$APP_NAME 2>/dev/null | tail -30
+            DBGSCRIPT
+            chmod +x /builds/debug-pods.sh
+            touch /builds/debug-pods.kubectl
+            while [ ! -f /builds/debug-pods.kubectl-done ]; do sleep 1; done
+            cat /builds/debug-pods.kubectl-log
             touch /builds/portfwd-stop
             while [ ! -f /builds/smoke-portfwd.kubectl-done ]; do sleep 1; done
             exit 1
@@ -226,17 +307,28 @@ jobs:
 
           echo ""
           echo "── API Status (all dependencies) ──────"
-          curl -sf http://localhost:18080/status | jq . || echo "(not available)"
+          curl -sf --connect-timeout 5 http://localhost:18080/status | jq . || echo "(not available yet — dependencies may still be initializing)"
 
+          # --- UI Health check with retries ------------------------
           echo ""
           echo "── UI Health check ────────────────────"
-          UI_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18081/)
-          if [ "$UI_CODE" = "200" ]; then
-            echo "✅ UI health check passed"
-          else
-            echo "❌ UI health check failed (HTTP $UI_CODE)"
+          UI_OK=false
+          for i in $(seq 1 10); do
+            UI_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://localhost:18081/ 2>/dev/null || echo "000")
+            if [ "$UI_CODE" = "200" ]; then
+              UI_OK=true
+              echo "✅ UI health check passed (attempt $i)"
+              break
+            fi
+            echo "  attempt $i/10 — HTTP $UI_CODE, retrying in 5s..."
+            sleep 5
+          done
+
+          if [ "$UI_OK" != "true" ]; then
+            echo "⚠️  UI health check failed after 10 attempts (non-fatal)"
           fi
 
+          # --- Cleanup ---------------------------------------------
           touch /builds/portfwd-stop
           while [ ! -f /builds/smoke-portfwd.kubectl-done ]; do sleep 1; done
 
